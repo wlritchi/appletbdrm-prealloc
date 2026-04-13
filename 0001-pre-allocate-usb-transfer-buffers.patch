@@ -1,0 +1,137 @@
+diff --git a/appletbdrm.c b/appletbdrm.c
+index 3bae91d7eefe..2907757f30ce 100644
+--- a/appletbdrm.c
++++ b/appletbdrm.c
+@@ -23,6 +23,7 @@
+ #include <drm/drm_crtc.h>
+ #include <drm/drm_damage_helper.h>
+ #include <drm/drm_drv.h>
++#include <drm/drm_managed.h>
+ #include <drm/drm_encoder.h>
+ #include <drm/drm_format_helper.h>
+ #include <drm/drm_fourcc.h>
+@@ -129,6 +130,10 @@ struct appletbdrm_device {
+ 	unsigned int width;
+ 	unsigned int height;
+ 
++	struct appletbdrm_fb_request *request_buf;
++	size_t request_buf_size;
++	struct appletbdrm_fb_request_response *response_buf;
++
+ 	struct drm_device drm;
+ 	struct drm_display_mode mode;
+ 	struct drm_connector connector;
+@@ -139,8 +144,6 @@ struct appletbdrm_device {
+ 
+ struct appletbdrm_plane_state {
+ 	struct drm_shadow_plane_state base;
+-	struct appletbdrm_fb_request *request;
+-	struct appletbdrm_fb_request_response *response;
+ 	size_t request_size;
+ 	size_t frames_size;
+ };
+@@ -303,6 +306,31 @@ static u32 rect_size(struct drm_rect *rect)
+ 		(BITS_TO_BYTES(APPLETBDRM_BITS_PER_PIXEL));
+ }
+ 
++static int appletbdrm_alloc_bufs(struct appletbdrm_device *adev)
++{
++	size_t max_pixel_bytes = (size_t)adev->width * adev->height *
++				 BITS_TO_BYTES(APPLETBDRM_BITS_PER_PIXEL);
++	size_t max_frames_size = struct_size((struct appletbdrm_frame *)0,
++					     buf, max_pixel_bytes);
++
++	adev->request_buf_size = ALIGN(sizeof(struct appletbdrm_fb_request) +
++				       max_frames_size +
++				       sizeof(struct appletbdrm_fb_request_footer), 16);
++
++	adev->request_buf = drmm_kzalloc(&adev->drm, adev->request_buf_size,
++					 GFP_KERNEL);
++	if (!adev->request_buf)
++		return -ENOMEM;
++
++	adev->response_buf = drmm_kzalloc(&adev->drm,
++					  sizeof(*adev->response_buf),
++					  GFP_KERNEL);
++	if (!adev->response_buf)
++		return -ENOMEM;
++
++	return 0;
++}
++
+ static int appletbdrm_connector_helper_get_modes(struct drm_connector *connector)
+ {
+ 	struct appletbdrm_device *adev = drm_to_adev(connector->dev);
+@@ -353,14 +381,7 @@ static int appletbdrm_primary_plane_helper_atomic_check(struct drm_plane *plane,
+ 		       frames_size +
+ 		       sizeof(struct appletbdrm_fb_request_footer), 16);
+ 
+-	appletbdrm_state->request = kzalloc(request_size, GFP_KERNEL);
+-
+-	if (!appletbdrm_state->request)
+-		return -ENOMEM;
+-
+-	appletbdrm_state->response = kzalloc(sizeof(*appletbdrm_state->response), GFP_KERNEL);
+-
+-	if (!appletbdrm_state->response)
++	if (request_size > drm_to_adev(plane->dev)->request_buf_size)
+ 		return -ENOMEM;
+ 
+ 	appletbdrm_state->request_size = request_size;
+@@ -375,11 +396,11 @@ static int appletbdrm_flush_damage(struct appletbdrm_device *adev,
+ {
+ 	struct appletbdrm_plane_state *appletbdrm_state = to_appletbdrm_plane_state(state);
+ 	struct drm_shadow_plane_state *shadow_plane_state = to_drm_shadow_plane_state(state);
+-	struct appletbdrm_fb_request_response *response = appletbdrm_state->response;
++	struct appletbdrm_fb_request_response *response = adev->response_buf;
+ 	struct appletbdrm_fb_request_footer *footer;
+ 	struct drm_atomic_helper_damage_iter iter;
+ 	struct drm_framebuffer *fb = state->fb;
+-	struct appletbdrm_fb_request *request = appletbdrm_state->request;
++	struct appletbdrm_fb_request *request = adev->request_buf;
+ 	struct drm_device *drm = &adev->drm;
+ 	struct appletbdrm_frame *frame;
+ 	u64 timestamp = ktime_get_ns();
+@@ -397,6 +418,8 @@ static int appletbdrm_flush_damage(struct appletbdrm_device *adev,
+ 		goto end_fb_cpu_access;
+ 	}
+ 
++	memset(request, 0, request_size);
++
+ 	request->header.unk_00 = cpu_to_le16(2);
+ 	request->header.unk_02 = cpu_to_le16(0x12);
+ 	request->header.unk_04 = cpu_to_le32(9);
+@@ -524,10 +547,6 @@ static struct drm_plane_state *appletbdrm_primary_plane_duplicate_state(struct d
+ 	if (!appletbdrm_state)
+ 		return NULL;
+ 
+-	/* Request and response are not duplicated and are allocated in .atomic_check */
+-	appletbdrm_state->request = NULL;
+-	appletbdrm_state->response = NULL;
+-
+ 	appletbdrm_state->request_size = 0;
+ 	appletbdrm_state->frames_size = 0;
+ 
+@@ -543,9 +562,6 @@ static void appletbdrm_primary_plane_destroy_state(struct drm_plane *plane,
+ {
+ 	struct appletbdrm_plane_state *appletbdrm_state = to_appletbdrm_plane_state(state);
+ 
+-	kfree(appletbdrm_state->request);
+-	kfree(appletbdrm_state->response);
+-
+ 	__drm_gem_destroy_shadow_plane_state(&appletbdrm_state->base);
+ 
+ 	kfree(appletbdrm_state);
+@@ -767,6 +783,12 @@ static int appletbdrm_probe(struct usb_interface *intf,
+ 		return ret;
+ 	}
+ 
++	ret = appletbdrm_alloc_bufs(adev);
++	if (ret) {
++		drm_err(drm, "Failed to allocate USB transfer buffers\n");
++		return ret;
++	}
++
+ 	ret = appletbdrm_signal_readiness(adev);
+ 	if (ret) {
+ 		drm_err(drm, "Failed to signal readiness\n");

@@ -1,0 +1,7 @@
+pkg/
+src/
+*.pkg.tar.*
+*.log
+.worktrees/
+# Downloaded source (fetched by makepkg)
+appletbdrm.c
