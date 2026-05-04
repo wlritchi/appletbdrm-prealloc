@@ -1,7 +1,7 @@
 # Maintainer: Luc Ritchie
 
 _pkgbase=appletbdrm-prealloc
-_kver=6.19.11
+_kver=7.0.3
 _archrel=1
 _tag=v${_kver}-arch${_archrel}
 
@@ -36,7 +36,7 @@ prepare() {
 
     for p in "${_patches[@]}"; do
         echo "Applying ${p}..."
-        patch -Np1 < "${p}"
+        patch -Np5 < "${p}"
     done
 }
 

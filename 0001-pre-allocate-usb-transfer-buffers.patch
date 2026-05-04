@@ -1,7 +1,36 @@
-diff --git a/appletbdrm.c b/appletbdrm.c
+From 0d286dd4184090eb3087bfb5d6f7329c3ed22e6a Mon Sep 17 00:00:00 2001
+From: Luc Ritchie <luc.ritchie@gmail.com>
+Date: Sun, 12 Apr 2026 20:32:08 -0400
+Subject: [PATCH] drm/appletbdrm: pre-allocate USB transfer buffers at probe
+ time
+
+The appletbdrm driver was allocating a USB request buffer (up to ~391KB
+for a full Touch Bar frame at 2170x60x24bpp) via kzalloc on every
+damage event in atomic_check, then freeing it in destroy_state.
+
+A ~391KB kzalloc requires an order-7 physically contiguous page
+allocation, which can fail under memory fragmentation even with plenty
+of free memory overall, leading to ENOMEM from DRM_IOCTL_MODE_DIRTYFB.
+Every other USB display driver in the kernel (UDL, GM12U320, udlfb,
+smscufx) pre-allocates reusable transfer buffers at probe time.
+
+Move the request and response buffer allocations to probe, using
+drmm_kzalloc so they are automatically freed with the DRM device. The
+buffers are sized for the worst-case full-screen update and reused
+across frames, with a memset to zero before each use (matching the
+previous kzalloc zeroing behavior, needed because the protocol has
+unknown fields that were implicitly zero-initialized).
+
+Assisted-by: Claude:claude-opus-4-6
+Signed-off-by: Luc Ritchie <luc.ritchie@gmail.com>
+---
+ drivers/gpu/drm/tiny/appletbdrm.c | 60 +++++++++++++++++++++----------
+ 1 file changed, 41 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/gpu/drm/tiny/appletbdrm.c b/drivers/gpu/drm/tiny/appletbdrm.c
 index 3bae91d7eefe..2907757f30ce 100644
---- a/appletbdrm.c
-+++ b/appletbdrm.c
+--- a/drivers/gpu/drm/tiny/appletbdrm.c
++++ b/drivers/gpu/drm/tiny/appletbdrm.c
 @@ -23,6 +23,7 @@
  #include <drm/drm_crtc.h>
  #include <drm/drm_damage_helper.h>
@@ -71,7 +100,7 @@ index 3bae91d7eefe..2907757f30ce 100644
 -	if (!appletbdrm_state->request)
 -		return -ENOMEM;
 -
--	appletbdrm_state->response = kzalloc(sizeof(*appletbdrm_state->response), GFP_KERNEL);
+-	appletbdrm_state->response = kzalloc_obj(*appletbdrm_state->response);
 -
 -	if (!appletbdrm_state->response)
 +	if (request_size > drm_to_adev(plane->dev)->request_buf_size)
@@ -135,3 +164,6 @@ index 3bae91d7eefe..2907757f30ce 100644
  	ret = appletbdrm_signal_readiness(adev);
  	if (ret) {
  		drm_err(drm, "Failed to signal readiness\n");
+-- 
+2.51.2
+
