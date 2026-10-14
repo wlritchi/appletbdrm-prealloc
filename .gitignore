@@ -5,3 +5,4 @@ src/
 .worktrees/
 # Downloaded source (fetched by makepkg)
 appletbdrm.c
+.claude/worktrees/

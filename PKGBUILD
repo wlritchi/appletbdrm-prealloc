@@ -1,7 +1,7 @@
 # Maintainer: Luc Ritchie
 
 _pkgbase=appletbdrm-prealloc
-_kver=7.0.3
+_kver=7.2.9
 _archrel=1
 _tag=v${_kver}-arch${_archrel}
 
@@ -15,6 +15,7 @@ license=('GPL-2.0-only')
 depends=('dkms')
 _patches=(
     0001-pre-allocate-usb-transfer-buffers.patch
+    0002-serialize-usb-transfer-buffers.patch
 )
 
 source=(
@@ -25,6 +26,7 @@ source=(
     "${_patches[@]}"
 )
 sha256sums=('SKIP'
+            'SKIP'
             'SKIP'
             'SKIP'
             'SKIP'

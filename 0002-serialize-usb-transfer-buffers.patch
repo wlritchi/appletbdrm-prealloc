@@ -1,0 +1,106 @@
+From 68ff9c6e3df16b296792ffe63f4b8e794d7852e5 Mon Sep 17 00:00:00 2001
+From: Luc Ritchie <luc.ritchie@gmail.com>
+Date: Mon, 4 May 2026 02:49:14 -0400
+Subject: [PATCH 2/2] drm/appletbdrm: serialize access to shared USB transfer
+ buffers
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Commit "drm/appletbdrm: pre-allocate USB transfer buffers at probe time"
+moved the request and response buffers from per-plane-state allocations
+to per-device buffers shared across all flush_damage calls. The shared
+buffers were not protected by any lock.
+
+In the current driver (single CRTC, single plane), the DRM atomic commit
+infrastructure serializes commits per-CRTC, so concurrent flush_damage
+calls are not expected in practice. However, relying on that implicit
+serialization is fragile and undocumented; explicit locking makes the
+ownership of the shared buffers clear and is the convention used by
+other USB DRM drivers (e.g. gm12u320).
+
+Add a mutex to struct appletbdrm_device, initialized via drmm_mutex_init
+to match the lifetime of the drmm-allocated buffers, and hold it across
+the entire use of the buffers in appletbdrm_flush_damage (from the
+memset that prepares the request through validation of the response). A
+mutex (rather than a spinlock) is required because usb_bulk_msg() may
+sleep; this is safe because flush_damage runs in process context from
+the atomic commit tail.
+
+The clear-display path (atomic_disable) does not touch these buffers --
+it allocates its own request via appletbdrm_send_msg -- and so does not
+need the lock.
+
+Reported-by: André Eikmeyer <andre@negmaster.com>
+Assisted-by: Claude:claude-opus-4-7
+Signed-off-by: Luc Ritchie <luc.ritchie@gmail.com>
+---
+ drivers/gpu/drm/tiny/appletbdrm.c | 14 ++++++++++----
+ 1 file changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/tiny/appletbdrm.c b/drivers/gpu/drm/tiny/appletbdrm.c
+index 7d1deb62670b..272e240f049a 100644
+--- a/drivers/gpu/drm/tiny/appletbdrm.c
++++ b/drivers/gpu/drm/tiny/appletbdrm.c
+@@ -12,6 +12,7 @@
+ #include <linux/container_of.h>
+ #include <linux/err.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/overflow.h>
+ #include <linux/slab.h>
+ #include <linux/types.h>
+@@ -133,6 +134,7 @@ struct appletbdrm_device {
+ 	struct appletbdrm_fb_request *request_buf;
+ 	size_t request_buf_size;
+ 	struct appletbdrm_fb_request_response *response_buf;
++	struct mutex flush_lock;	/* protects request_buf and response_buf */
+ 
+ 	struct drm_device drm;
+ 	struct drm_display_mode mode;
+@@ -328,7 +330,7 @@ static int appletbdrm_alloc_bufs(struct appletbdrm_device *adev)
+ 	if (!adev->response_buf)
+ 		return -ENOMEM;
+ 
+-	return 0;
++	return drmm_mutex_init(&adev->drm, &adev->flush_lock);
+ }
+ 
+ static int appletbdrm_connector_helper_get_modes(struct drm_connector *connector)
+@@ -424,6 +426,8 @@ static int appletbdrm_flush_damage(struct appletbdrm_device *adev,
+ 		goto end_fb_cpu_access;
+ 	}
+ 
++	mutex_lock(&adev->flush_lock);
++
+ 	memset(request, 0, request_size);
+ 
+ 	request->header.unk_00 = cpu_to_le16(2);
+@@ -477,19 +481,21 @@ static int appletbdrm_flush_damage(struct appletbdrm_device *adev,
+ 
+ 	ret = appletbdrm_send_request(adev, &request->header, request_size);
+ 	if (ret)
+-		goto end_fb_cpu_access;
++		goto unlock;
+ 
+ 	ret = appletbdrm_read_response(adev, &response->header, sizeof(*response),
+ 				       APPLETBDRM_MSG_UPDATE_COMPLETE);
+ 	if (ret)
+-		goto end_fb_cpu_access;
++		goto unlock;
+ 
+ 	if (response->timestamp != footer->timestamp) {
+ 		drm_err(drm, "Response timestamp (%llu) doesn't match request timestamp (%llu)\n",
+ 			le64_to_cpu(response->timestamp), timestamp);
+-		goto end_fb_cpu_access;
++		goto unlock;
+ 	}
+ 
++unlock:
++	mutex_unlock(&adev->flush_lock);
+ end_fb_cpu_access:
+ 	drm_gem_fb_end_cpu_access(fb, DMA_FROM_DEVICE);
+ 
+-- 
+2.54.0
+

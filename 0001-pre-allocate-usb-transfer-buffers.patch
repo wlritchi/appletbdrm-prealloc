@@ -1,16 +1,29 @@
-From 0d286dd4184090eb3087bfb5d6f7329c3ed22e6a Mon Sep 17 00:00:00 2001
+From aa117688b08a7989250f6bad3e81bb400ece2bdb Mon Sep 17 00:00:00 2001
 From: Luc Ritchie <luc.ritchie@gmail.com>
 Date: Sun, 12 Apr 2026 20:32:08 -0400
-Subject: [PATCH] drm/appletbdrm: pre-allocate USB transfer buffers at probe
- time
+Subject: [PATCH 1/2] drm/appletbdrm: pre-allocate USB transfer buffers at
+ probe time
 
-The appletbdrm driver was allocating a USB request buffer (up to ~391KB
-for a full Touch Bar frame at 2170x60x24bpp) via kzalloc on every
-damage event in atomic_check, then freeing it in destroy_state.
+The appletbdrm driver allocates a USB request buffer (up to ~391KB for
+a full Touch Bar frame at 2170x60x24bpp) via kvzalloc on every damage
+event in begin_fb_access, then frees it in destroy_state.
 
-A ~391KB kzalloc requires an order-7 physically contiguous page
-allocation, which can fail under memory fragmentation even with plenty
-of free memory overall, leading to ENOMEM from DRM_IOCTL_MODE_DIRTYFB.
+Commit aaaa684bab1f ("drm/appletbdrm: Use kvzalloc for big
+allocations") changed this allocation from kzalloc to kvzalloc, to fix
+allocation failures from memory fragmentation. But the buffer is passed
+to usb_bulk_msg(), and USB transfer buffers must be DMA-capable. When
+the physically contiguous allocation fails, kvzalloc falls back to
+vmalloc, and usb_hcd_map_urb_for_dma() then fails in dma_map_single():
+
+  t2bce_core 0000:04:00.1: rejecting DMA map of vmalloc memory
+  WARNING: ./include/linux/dma-mapping.h:523 at usb_hcd_map_urb_for_dma+0x524/0x580
+  appletbdrm 7-6:2.1: [drm] *ERROR* Failed to send message (-11)
+
+kvzalloc also removes __GFP_DIRECT_RECLAIM from the kmalloc attempt for
+sizes larger than PAGE_SIZE. Thus the vmalloc fallback occurs each time
+an order-7 block is not immediately available, which is more frequent
+than the kzalloc failures that the commit tried to fix.
+
 Every other USB display driver in the kernel (UDL, GM12U320, udlfb,
 smscufx) pre-allocates reusable transfer buffers at probe time.
 
@@ -18,17 +31,19 @@ Move the request and response buffer allocations to probe, using
 drmm_kzalloc so they are automatically freed with the DRM device. The
 buffers are sized for the worst-case full-screen update and reused
 across frames, with a memset to zero before each use (matching the
-previous kzalloc zeroing behavior, needed because the protocol has
+previous kvzalloc zeroing behavior, needed because the protocol has
 unknown fields that were implicitly zero-initialized).
 
+Fixes: aaaa684bab1f ("drm/appletbdrm: Use kvzalloc for big allocations")
 Assisted-by: Claude:claude-opus-4-6
+Assisted-by: Claude:claude-opus-5-5
 Signed-off-by: Luc Ritchie <luc.ritchie@gmail.com>
 ---
  drivers/gpu/drm/tiny/appletbdrm.c | 60 +++++++++++++++++++++----------
  1 file changed, 41 insertions(+), 19 deletions(-)
 
 diff --git a/drivers/gpu/drm/tiny/appletbdrm.c b/drivers/gpu/drm/tiny/appletbdrm.c
-index 3bae91d7eefe..2907757f30ce 100644
+index ef71b9957961..7d1deb62670b 100644
 --- a/drivers/gpu/drm/tiny/appletbdrm.c
 +++ b/drivers/gpu/drm/tiny/appletbdrm.c
 @@ -23,6 +23,7 @@
@@ -91,11 +106,11 @@ index 3bae91d7eefe..2907757f30ce 100644
  static int appletbdrm_connector_helper_get_modes(struct drm_connector *connector)
  {
  	struct appletbdrm_device *adev = drm_to_adev(connector->dev);
-@@ -353,14 +381,7 @@ static int appletbdrm_primary_plane_helper_atomic_check(struct drm_plane *plane,
+@@ -336,14 +364,7 @@ static int appletbdrm_primary_plane_helper_begin_fb_access(struct drm_plane *pla
  		       frames_size +
  		       sizeof(struct appletbdrm_fb_request_footer), 16);
  
--	appletbdrm_state->request = kzalloc(request_size, GFP_KERNEL);
+-	appletbdrm_state->request = kvzalloc(request_size, GFP_KERNEL);
 -
 -	if (!appletbdrm_state->request)
 -		return -ENOMEM;
@@ -107,7 +122,7 @@ index 3bae91d7eefe..2907757f30ce 100644
  		return -ENOMEM;
  
  	appletbdrm_state->request_size = request_size;
-@@ -375,11 +396,11 @@ static int appletbdrm_flush_damage(struct appletbdrm_device *adev,
+@@ -381,11 +402,11 @@ static int appletbdrm_flush_damage(struct appletbdrm_device *adev,
  {
  	struct appletbdrm_plane_state *appletbdrm_state = to_appletbdrm_plane_state(state);
  	struct drm_shadow_plane_state *shadow_plane_state = to_drm_shadow_plane_state(state);
@@ -121,7 +136,7 @@ index 3bae91d7eefe..2907757f30ce 100644
  	struct drm_device *drm = &adev->drm;
  	struct appletbdrm_frame *frame;
  	u64 timestamp = ktime_get_ns();
-@@ -397,6 +418,8 @@ static int appletbdrm_flush_damage(struct appletbdrm_device *adev,
+@@ -403,6 +424,8 @@ static int appletbdrm_flush_damage(struct appletbdrm_device *adev,
  		goto end_fb_cpu_access;
  	}
  
@@ -130,7 +145,7 @@ index 3bae91d7eefe..2907757f30ce 100644
  	request->header.unk_00 = cpu_to_le16(2);
  	request->header.unk_02 = cpu_to_le16(0x12);
  	request->header.unk_04 = cpu_to_le32(9);
-@@ -524,10 +547,6 @@ static struct drm_plane_state *appletbdrm_primary_plane_duplicate_state(struct d
+@@ -530,10 +553,6 @@ static struct drm_plane_state *appletbdrm_primary_plane_duplicate_state(struct d
  	if (!appletbdrm_state)
  		return NULL;
  
@@ -141,17 +156,17 @@ index 3bae91d7eefe..2907757f30ce 100644
  	appletbdrm_state->request_size = 0;
  	appletbdrm_state->frames_size = 0;
  
-@@ -543,9 +562,6 @@ static void appletbdrm_primary_plane_destroy_state(struct drm_plane *plane,
+@@ -549,9 +568,6 @@ static void appletbdrm_primary_plane_destroy_state(struct drm_plane *plane,
  {
  	struct appletbdrm_plane_state *appletbdrm_state = to_appletbdrm_plane_state(state);
  
--	kfree(appletbdrm_state->request);
+-	kvfree(appletbdrm_state->request);
 -	kfree(appletbdrm_state->response);
 -
  	__drm_gem_destroy_shadow_plane_state(&appletbdrm_state->base);
  
  	kfree(appletbdrm_state);
-@@ -767,6 +783,12 @@ static int appletbdrm_probe(struct usb_interface *intf,
+@@ -774,6 +790,12 @@ static int appletbdrm_probe(struct usb_interface *intf,
  		return ret;
  	}
  
@@ -165,5 +180,5 @@ index 3bae91d7eefe..2907757f30ce 100644
  	if (ret) {
  		drm_err(drm, "Failed to signal readiness\n");
 -- 
-2.51.2
+2.54.0
 
